@@ -4,3 +4,4 @@ __pycache__/
 data/jobs/
 models/*.bin
 models/*.gguf
+tools/

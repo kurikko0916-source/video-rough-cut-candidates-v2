@@ -27,7 +27,15 @@ LOCK = threading.Lock()
 
 def tool_path(env_name: str, default_name: str) -> str | None:
     configured = os.getenv(env_name)
-    return configured if configured and Path(configured).exists() else shutil.which(default_name)
+    if configured and Path(configured).exists(): return configured
+    local_candidates = {
+        "ffmpeg": ROOT / "tools" / "runtime" / "bin" / "ffmpeg",
+        "ffprobe": ROOT / "tools" / "runtime" / "bin" / "ffprobe",
+        "whisper-cli": ROOT / "tools" / "runtime" / "bin" / "whisper-cli",
+        "ollama": ROOT / "tools" / "Ollama.app" / "Contents" / "Resources" / "ollama",
+    }
+    local = local_candidates.get(default_name)
+    return str(local) if local and local.exists() else shutil.which(default_name)
 
 
 def whisper_model() -> Path:
@@ -171,18 +179,21 @@ def llm_candidates(segments: list[dict], model: str) -> list[dict]:
     for offset in range(0, len(segments), 55):
         chunk = segments[max(0, offset - 3): offset + 58]
         transcript = "\n".join(f'[{s["start"]:.2f}-{s["end"]:.2f}] {s["text"]}' for s in chunk)
-        prompt = f"""あなたは建築・住宅YouTubeの保守的な粗カット補助です。次の日本語対談から、高い確信度で不要なまとまった区間だけを選びます。
+        prompt = f"""/no_think
+あなたは建築・住宅YouTubeの保守的な粗カット補助です。次の日本語対談から、高い確信度で不要なまとまった区間だけを選びます。
 対象: 撮影中の打ち合わせ、仕切り直し、失敗テイク、直後に完全に言い直した前半、追加情報のない明らかな重複、長く内容のない言い淀み。
 対象外: 短い「あのー」「えーと」単体、雑談、専門説明、長いが内容のある説明、追加情報のある繰り返し。迷う場合は必ず残します。
 判定時刻は提供した発言境界から選び、JSONのみを返してください。
 {{"candidates":[{{"start_seconds":0.0,"end_seconds":0.0,"resume_text":"削除後の最初の発言","category":"種類","confidence":"high"}}]}}
 
 {transcript}"""
-        body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False, "format": "json", "options": {"temperature": 0.1}}, ensure_ascii=False).encode("utf-8")
+        body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False, "think": False, "format": "json", "options": {"temperature": 0.1}}, ensure_ascii=False).encode("utf-8")
         try:
             request = Request("http://127.0.0.1:11434/api/chat", data=body, headers={"Content-Type": "application/json"})
             with urlopen(request, timeout=300) as response: content = json.load(response)["message"]["content"]
-            parsed = json.loads(content)
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            json_block = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            parsed = json.loads(json_block.group(0) if json_block else content)
             for item in parsed.get("candidates", []):
                 if item.get("confidence") == "high": item["source"] = "local_llm"; found.append(item)
         except (URLError, TimeoutError, OSError, KeyError, ValueError, json.JSONDecodeError):
@@ -197,10 +208,14 @@ def snap_and_merge(candidates: list[dict], segments: list[dict], duration: float
     for item in candidates:
         try: start, end = float(item["start_seconds"]), float(item["end_seconds"])
         except (KeyError, TypeError, ValueError): continue
-        if item.get("source") == "local_llm": start, end = nearest(start), nearest(end)
+        is_llm = item.get("source") == "local_llm"
+        if is_llm: start, end = nearest(start), nearest(end)
         start, end = max(0, start), min(duration, end)
         if end - start < .7 or end <= start: continue
-        valid.append({"start_seconds": round(start, 3), "end_seconds": round(end, 3), "resume_text": str(item.get("resume_text") or resume_text(segments, end))[:120], "category": item.get("category", "その他"), "confidence": "high", "source": item.get("source", "unknown")})
+        category = str(item.get("category") or "AI判定")
+        if is_llm and category not in {"撮影中の打ち合わせ", "仕切り直し", "失敗テイク", "言い直し", "明らかな重複", "長い言い淀み"}: category = "AI判定"
+        resume = resume_text(segments, end) if is_llm else str(item.get("resume_text") or resume_text(segments, end))
+        valid.append({"start_seconds": round(start, 3), "end_seconds": round(end, 3), "resume_text": resume[:120], "category": category, "confidence": "high", "source": item.get("source", "unknown")})
     valid.sort(key=lambda item: item["start_seconds"])
     merged = []
     for item in valid:
@@ -230,7 +245,7 @@ def analyze_job(job_id: str) -> None:
         update(job_id, phase="analyze", progress=72)
         candidates = rule_candidates(segments, silences)
         warnings = []
-        model = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+        model = os.getenv("OLLAMA_MODEL", "qwen3:4b")
         if ollama_available(model): candidates.extend(llm_candidates(segments, model))
         else: warnings.append("Ollamaのモデルが起動していないため、今回は明示的な仕切り直しと無音を中心に判定しました。")
         update(job_id, phase="merge", progress=91)
