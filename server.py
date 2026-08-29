@@ -20,7 +20,9 @@ ROOT = Path(__file__).resolve().parent
 JOBS_DIR = ROOT / "data" / "jobs"
 MODELS_DIR = ROOT / "models"
 HOST, PORT = "127.0.0.1", 8765
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
+# 高画質の収録素材は30分程度でも20GBを超えることがある。
+# ローカル処理なので、実用上の誤操作防止として100GBを上限にする。
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
 
@@ -285,9 +287,18 @@ class Handler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/api/jobs": return self.send_error(404)
         # 一部のMac用ブラウザーはBlob送信時にContent-Lengthを公開しない。
         # 画面側がFile.sizeから付与したローカル専用ヘッダーを代替として使う。
-        try: size = int(self.headers.get("Content-Length") or self.headers.get("X-File-Size") or "0")
+        # File.sizeを入れたローカル専用ヘッダーを優先する。
+        # ブラウザーによっては大容量BlobのContent-Lengthが正しく公開されない。
+        declared_size = self.headers.get("X-File-Size") or self.headers.get("Content-Length") or "0"
+        try: size = int(declared_size)
         except ValueError: size = 0
-        if size <= 0 or size > MAX_UPLOAD_BYTES: return self.json_response({"error": "動画のファイル容量を確認できません。"}, 400)
+        if size <= 0:
+            print(f"[upload rejected] invalid size: {declared_size!r}")
+            return self.json_response({"error": "動画のファイル容量を確認できません。動画を選び直してください。"}, 400)
+        if size > MAX_UPLOAD_BYTES:
+            size_gb = size / 1024 / 1024 / 1024
+            print(f"[upload rejected] too large: {size} bytes")
+            return self.json_response({"error": f"動画は{size_gb:.1f}GBです。現在は100GB以下のMP4に対応しています。"}, 400)
         filename = unquote(self.headers.get("X-Filename", "video.mp4"))
         if not filename.lower().endswith(".mp4"): return self.json_response({"error": "MP4動画を選んでください。"}, 400)
         job_id = uuid.uuid4().hex; job_dir = JOBS_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=False); target = job_dir / "input.mp4"
