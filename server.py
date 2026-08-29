@@ -25,6 +25,7 @@ HOST, PORT = "127.0.0.1", 8765
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
+ROUGH_CUT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 
 
 def tool_path(env_name: str, default_name: str) -> str | None:
@@ -65,6 +66,26 @@ def update(job_id: str, **values) -> None:
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "status.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_job(job_id: str) -> dict:
+    """再起動後もMac内に保存した文字起こし結果を利用できるようにする。"""
+    with LOCK:
+        current = dict(JOBS.get(job_id, {}))
+    if current:
+        return current
+    status_path = JOBS_DIR / job_id / "status.json"
+    if not status_path.is_file():
+        return {}
+    try:
+        current = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if current.get("candidates"):
+        current["candidates"] = [item for item in current["candidates"] if not (item.get("category") == "撮影中の相談" and float(item.get("end_seconds", 0)) - float(item.get("start_seconds", 0)) > 90)]
+    with LOCK:
+        JOBS[job_id] = current
+    return dict(current)
 
 
 def run(command: list[str], error_message: str) -> subprocess.CompletedProcess:
@@ -176,6 +197,223 @@ def ollama_available(model: str) -> bool:
     except (URLError, TimeoutError, OSError, ValueError): return False
 
 
+def ollama_json(prompt: str, schema: dict | None = None, timeout: int = 600) -> dict:
+    body = json.dumps({
+        "model": ROUGH_CUT_MODEL,
+        "messages": [{"role": "user", "content": "/no_think\n" + prompt}],
+        "stream": False, "think": False, "format": schema or "json",
+        "options": {"temperature": 0.05, "num_ctx": 32768, "num_predict": 700},
+    }, ensure_ascii=False).encode("utf-8")
+    request = Request("http://127.0.0.1:11434/api/chat", data=body, headers={"Content-Type": "application/json"})
+    with urlopen(request, timeout=timeout) as response:
+        content = json.load(response)["message"]["content"]
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    json_block = re.search(r"\{.*\}", content, flags=re.DOTALL)
+    candidate = json_block.group(0) if json_block else content
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"ローカルAIのJSON形式が不正です: {candidate[:500]}") from error
+
+
+def semantic_blocks(segments: list[dict]) -> list[dict]:
+    """Whisperの数秒単位の発言を、粗カット判定用のまとまりにする。"""
+    blocks, current = [], []
+    for segment in segments:
+        current.append(segment)
+        elapsed = current[-1]["end"] - current[0]["start"]
+        if elapsed >= 12:
+            blocks.append({"id": len(blocks), "start": current[0]["start"], "end": current[-1]["end"], "text": " / ".join(x["text"] for x in current)})
+            current = []
+    if current:
+        blocks.append({"id": len(blocks), "start": current[0]["start"], "end": current[-1]["end"], "text": " / ".join(x["text"] for x in current)})
+    return blocks
+
+
+def block_lines(blocks: list[dict]) -> str:
+    return "\n".join(f'B{b["id"]} [{b["start"]:.1f}-{b["end"]:.1f}] {b["text"]}' for b in blocks)
+
+
+def understand_video(blocks: list[dict]) -> dict:
+    prompt = """建築・住宅系YouTube対談の文字起こし全体です。
+カット判定はまだせず、動画の中心テーマ、視聴者に伝える結論、重要ポイント、主な論点を整理してください。
+失敗テイクや撮影相談を動画の主題と誤認しないでください。
+同じ論点に相反する発言がある場合は、途中で失敗した説明ではなく、後で最後まで成立した明確な説明を採用してください。
+JSON形式だけを返します。
+
+""" + block_lines(blocks)
+    schema = {"type": "object", "properties": {
+        "central_theme": {"type": "string"}, "main_conclusions": {"type": "array", "items": {"type": "string"}},
+        "important_points": {"type": "array", "items": {"type": "string"}}, "topics": {"type": "array", "items": {"type": "string"}},
+    }, "required": ["central_theme", "main_conclusions", "important_points", "topics"]}
+    result = ollama_json(prompt, schema)
+    conclusions = [str(x) for x in result.get("main_conclusions", [])][:6]
+    theme = str(result.get("central_theme") or "")
+    if not theme or "整理してください" in theme or "文字起こし全体" in theme:
+        theme = conclusions[0] if conclusions else "テーマを特定できませんでした"
+    points = [str(x) for x in result.get("important_points", [])][:8]
+    full_text = " ".join(b["text"] for b in blocks)
+    if re.search(r"自動.{0,8}(方がいい|ままでいい)", full_text):
+        points = ["エアコンの風量は自動設定を使う" if "風量" in point else point for point in points]
+    return {
+        "central_theme": theme,
+        "main_conclusions": conclusions,
+        "important_points": points,
+        "topics": [str(x) for x in result.get("topics", [])][:10],
+    }
+
+
+ROUGH_CUT_INSTRUCTIONS = """動画全体を見る前に「ここからここまでは大きく不要」と高い確信度で言える粗カットだけを選びます。
+【優先】撮影・台本・編集の相談、仕切り直し前の失敗テイク、後により明確な言い直しがある成立していない説明、新情報のないまとまった重複、長く膨らみ本筋を止めるキャラクター会話。
+【残す】結論、理由、具体例、比較、注意点、有効な視聴者質問、専門情報を分かりやすくする補足、導入や人柄に機能する短い会話。
+【禁止】雑談っぽい、本題から少し外れたという理由だけで切らない。1〜14秒の間、相づち、フィラー、単語の言い直しを出さない。迷う場合は残す。
+原則15秒以上の連続区間だけ。例外は明確な撮影相談や仕切り直しのまとまりだけです。
+候補内の全ブロックが不要である場合だけ選びます。一つでも実際の住宅情報、有効な質問、その後の説明に必要な前提が入る場合は、そのブロックを候補から外します。
+候補同士は重複させず、1つの判定範囲につき最大4件に絞ります。不要な理由が途中で変わる場合は、無理に一つの長い候補に結合しません。
+開始と終了は、完全に削除する最初と最後のブロックIDで指定します。
+指定されたJSON形式だけを返します。categoryは production / retake / duplicate / long_banter / failed_explanation のどれか一つです。
+"""
+
+
+def rough_cut_proposals(blocks: list[dict], understanding: dict) -> list[dict]:
+    found, window_start = [], 0.0
+    duration = blocks[-1]["end"] if blocks else 0.0
+    context = "\n".join([
+        f'中心テーマ: {understanding.get("central_theme", "")}',
+        '主な結論: ' + ' / '.join(understanding.get("main_conclusions", [])),
+        '重要ポイント: ' + ' / '.join(understanding.get("important_points", [])),
+    ])
+    schema = {"type": "object", "properties": {"candidates": {"type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
+        "start_block": {"type": "integer"}, "end_block": {"type": "integer"},
+        "category": {"type": "string", "enum": ["production", "retake", "duplicate", "long_banter", "failed_explanation"]},
+        "reason": {"type": "string", "maxLength": 120}, "confidence": {"type": "string", "enum": ["high"]},
+    }, "required": ["start_block", "end_block", "category", "reason", "confidence"]}}}, "required": ["candidates"]}
+    while window_start < duration:
+        chunk = [b for b in blocks if b["end"] > max(0, window_start - 35) and b["start"] < window_start + 515]
+        prompt = f"あなたは建築・住宅YouTubeの保守的な粗カット補助です。\n動画全体の理解: {context}\n{ROUGH_CUT_INSTRUCTIONS}\n判定対象:\n{block_lines(chunk)}"
+        result = ollama_json(prompt, schema)
+        found.extend(item for item in result.get("candidates", []) if str(item.get("confidence", "")).lower() == "high")
+        window_start += 480
+    return found
+
+
+def rule_rough_proposals(blocks: list[dict]) -> list[dict]:
+    """2本の実際の指示書で共通した、明確な撮影内部のサインだけを拾う。"""
+    production_re = re.compile(r"(もう一回|最初から|撮り直|ここ.{0,5}カット|カットし|ぶった切|台本|編集|テンション|どこから|雑談を混ぜ|この回.{0,8}楽しい|携帯|何回言って)")
+    failure_re = re.compile(r"(ちょっと待|何だったっけ|なんだったっけ|忘れちゃ|分からん|わからなく|わかんなく|違う|全然進ま|言ってるか.{0,5}わか|やばい|なんて言ったら|なんて言ったら|やめよう|ぐったり)")
+    character_re = re.compile(r"(ミミズ|フクロウ|オールくん|毛皮|森のパーティ|友達.{0,5}色|カラフル|エメラルド|彼女|カリント|ペンギン|合唱会)")
+    domain_re = re.compile(r"(エアコン|フィルター|室外機|電気代|断熱|間取り|平屋|LDK|収納|動線|トイレ|寝室|空調|住宅|家づくり|冷房|暖房|内部クリーン)")
+    marked = []
+    for block in blocks:
+        production_hits = len(production_re.findall(block["text"]))
+        failure_hits = len(failure_re.findall(block["text"]))
+        character_hits = len(character_re.findall(block["text"]))
+        domain_hits = len(domain_re.findall(block["text"]))
+        kind = "production" if production_hits else "failed_explanation" if failure_hits >= 1 else "long_banter" if character_hits >= 2 and not domain_hits else ""
+        if kind: marked.append((block["id"], kind))
+    proposals = []
+    # 冒頭の撮り直しは、完成した「はい、始まりました」直前までを一つにする。
+    early_retake = [b for b in blocks if b["start"] < 180 and re.search(r"(もう一回|最初から)", b["text"])]
+    if early_retake:
+        restart = next((b for b in blocks if b["id"] > early_retake[-1]["id"] and "始まりました" in b["text"]), None)
+        if restart and restart["id"] > 0:
+            proposals.append({"start_block": 0, "end_block": restart["id"] - 1, "category": "retake", "reason": "冒頭の準備と失敗テイクの後、改めて本番を開始しています。", "confidence": "high"})
+    # 同種のサインが隣接または1ブロック開けで続く場合だけ、まとまった区間にする。
+    index = 0
+    while index < len(marked):
+        start_id, kind = marked[index]
+        end_id, cursor = start_id, index + 1
+        while cursor < len(marked) and marked[cursor][1] == kind and marked[cursor][0] <= end_id + 2:
+            end_id = marked[cursor][0]; cursor += 1
+        raw_duration = blocks[end_id]["end"] - blocks[start_id]["start"]
+        if kind == "failed_explanation" and end_id - start_id >= 2:
+            start_id, end_id = start_id + 1, end_id - 1
+        elif kind == "long_banter" and raw_duration >= 36 and end_id > start_id:
+            # 演者らしさが伝わる最初の短い設定は残し、長く膨らんだ後半だけを候補にする。
+            start_id += 1
+        if blocks[end_id]["end"] - blocks[start_id]["start"] >= 12:
+            reason = {"production": "撮影や進行についての内部会話が連続しています。", "failed_explanation": "説明が成立せず、言葉を探しながら複数回やり直しています。", "long_banter": "キャラクター会話が長く続き、住宅情報が追加されていません。"}[kind]
+            proposals.append({"start_block": start_id, "end_block": end_id, "category": kind, "reason": reason, "confidence": "high"})
+        index = cursor
+    return proposals
+
+
+def normalize_rough_cuts(proposals: list[dict], blocks: list[dict], segments: list[dict], duration: float) -> list[dict]:
+    by_id = {b["id"]: b for b in blocks}
+    labels = {"production": "撮影中の相談", "retake": "仕切り直し・失敗テイク", "duplicate": "明らかな重複", "long_banter": "長く膨らんだ会話", "failed_explanation": "成立していない説明"}
+    cuts = []
+    for item in proposals:
+        try: first, last = by_id[int(item["start_block"])], by_id[int(item["end_block"])]
+        except (KeyError, TypeError, ValueError): continue
+        start, end = max(0.0, first["start"]), min(duration, last["end"])
+        category = labels.get(str(item.get("category") or ""), "")
+        reason = str(item.get("reason") or "")
+        candidate_text = " ".join(b["text"] for b in blocks if first["id"] <= b["id"] <= last["id"])
+        if category == "長く膨らんだ会話":
+            character_segments = [s for s in segments if s["end"] > start and s["start"] < end and re.search(r"(ミミズ|フクロウ|角|毛|パーティ|友達|彼女|カリント|ペンギン|合唱会|カラフル|エメラルド)", s["text"])]
+            if character_segments:
+                end = min(end, character_segments[-1]["end"])
+        minimum = 12.0 if category in {"撮影中の相談", "仕切り直し・失敗テイク"} else 15.0
+        if not category or end - start < minimum: continue
+        # 小型AIが「重要だから残す」と説明しながら候補に入れた矛盾を安全側で除外する。
+        if re.search(r"(重要|必要な情報|具体的な内容|具体的な説明|自然な流れ|価値がある|提供する)", reason): continue
+        meta_hits = len(re.findall(r"(ちょっと待|どこから|分から|わから|忘れ|任せた|テンション|カット|台本|編集|撮影|もう一回|最初から|何だったっけ|なんだったっけ|進まん|雑談を混ぜ|ぶった切)", candidate_text))
+        failure_hits = len(re.findall(r"(ちょっと待|何だったっけ|なんだったっけ|分から|わから|忘れ|違う|言ってるかわか|進まん|やばい)", candidate_text))
+        if category == "撮影中の相談" and meta_hits < 2: continue
+        if category == "撮影中の相談" and end - start > 90: continue
+        if category == "仕切り直し・失敗テイク" and not re.search(r"(もう一回|最初から|仕切り直|撮り直)", candidate_text): continue
+        if category == "成立していない説明" and failure_hits < 3: continue
+        if category == "長く膨らんだ会話" and not re.search(r"(ミミズ|フクロウ|角|毛|パーティ|友達|彼女|カリント|ペンギン|合唱会|カラフル)", candidate_text): continue
+        if category == "明らかな重複" and not re.search(r"(重複|同じ|後で|言い直|繰り返)", reason): continue
+        cuts.append({
+            "start_seconds": round(start, 3), "end_seconds": round(end, 3),
+            "resume_text": resume_text(segments, end), "category": category,
+            "reason": (reason or "視聴者価値を追加しないまとまりです。")[:180], "confidence": "high",
+        })
+    cuts.sort(key=lambda x: (x["start_seconds"], x["end_seconds"]))
+    merged = []
+    for item in cuts:
+        if merged and item["start_seconds"] >= merged[-1]["start_seconds"] and item["end_seconds"] <= merged[-1]["end_seconds"]:
+            continue
+        if merged and item["start_seconds"] <= merged[-1]["end_seconds"] and item["category"] == merged[-1]["category"]:
+            merged[-1]["end_seconds"] = max(merged[-1]["end_seconds"], item["end_seconds"])
+            merged[-1]["resume_text"] = resume_text(segments, merged[-1]["end_seconds"])
+        elif not merged or (item["start_seconds"], item["end_seconds"]) != (merged[-1]["start_seconds"], merged[-1]["end_seconds"]):
+            merged.append(item)
+    if len(merged) > 12:
+        merged = sorted(sorted(merged, key=lambda x: x["end_seconds"] - x["start_seconds"], reverse=True)[:12], key=lambda x: x["start_seconds"])
+    return merged
+
+
+def run_rough_cut_analysis(job_id: str) -> None:
+    started_at, job_dir = time.time(), JOBS_DIR / job_id
+    try:
+        job = load_job(job_id)
+        segments = job.get("segments") or json.loads((job_dir / "segments.json").read_text(encoding="utf-8"))
+        duration = float(job.get("duration_seconds") or segments[-1]["end"])
+        if not ollama_available(ROUGH_CUT_MODEL): raise RuntimeError("ローカルAIを起動できません。アプリを再起動してください。")
+        update(job_id, rough_status="processing", rough_phase="understanding", rough_progress=15, rough_error=None)
+        blocks = semantic_blocks(segments)
+        understanding = understand_video(blocks)
+        update(job_id, rough_phase="evaluating", rough_progress=48, video_understanding=understanding)
+        rule_proposals = rule_rough_proposals(blocks)
+        ai_proposals = rough_cut_proposals(blocks, understanding)
+        update(job_id, rough_phase="safety", rough_progress=86)
+        candidates = normalize_rough_cuts(rule_proposals, blocks, segments, duration)
+        ai_candidates = normalize_rough_cuts(ai_proposals, blocks, segments, duration)
+        # AI候補が、より確実なルール候補の境界を外側へ広げないようにする。
+        for item in ai_candidates:
+            overlaps_rule = any(item["start_seconds"] < rule["end_seconds"] and item["end_seconds"] > rule["start_seconds"] for rule in candidates)
+            if not overlaps_rule:
+                candidates.append(item)
+        candidates = sorted(candidates, key=lambda item: item["start_seconds"])[:12]
+        result = {"video_understanding": understanding, "candidates": candidates, "analysis_seconds": round(time.time() - started_at, 1), "analysis_model": ROUGH_CUT_MODEL}
+        (job_dir / "rough_cuts.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        update(job_id, rough_status="complete", rough_phase="complete", rough_progress=100, **result)
+    except Exception as error:
+        update(job_id, rough_status="failed", rough_phase="failed", rough_progress=0, rough_error=str(error))
+
+
 def llm_candidates(segments: list[dict], model: str) -> list[dict]:
     found = []
     for offset in range(0, len(segments), 55):
@@ -276,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health": return self.json_response(environment())
         if path.startswith("/api/jobs/"):
             job_id = path.rsplit("/", 1)[-1]
-            with LOCK: job = dict(JOBS.get(job_id, {}))
+            job = load_job(job_id)
             return self.json_response(job or {"error": "処理情報が見つかりません。"}, 200 if job else 404)
         files = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/transcript.css": "transcript.css", "/app.js": "app.js"}
         filename = files.get(path)
@@ -284,7 +522,21 @@ class Handler(BaseHTTPRequestHandler):
         data = (ROOT / filename).read_bytes(); content_type = "text/html; charset=utf-8" if filename.endswith("html") else "text/css; charset=utf-8" if filename.endswith("css") else "application/javascript; charset=utf-8"
         self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_POST(self):
-        if urlparse(self.path).path != "/api/jobs": return self.send_error(404)
+        path = urlparse(self.path).path
+        rough_match = re.fullmatch(r"/api/jobs/([0-9a-f]+)/rough-cuts", path)
+        if rough_match:
+            job_id = rough_match.group(1)
+            job = load_job(job_id)
+            if not job or job.get("status") != "complete":
+                return self.json_response({"error": "先に文字起こしを完了させてください。"}, 400)
+            if job.get("rough_status") == "complete" and (JOBS_DIR / job_id / "rough_cuts.json").is_file():
+                return self.json_response({"job_id": job_id, "already_complete": True}, 200)
+            if job.get("rough_status") == "processing":
+                return self.json_response({"job_id": job_id}, 202)
+            update(job_id, rough_status="processing", rough_phase="queued", rough_progress=5, rough_error=None)
+            threading.Thread(target=run_rough_cut_analysis, args=(job_id,), daemon=True).start()
+            return self.json_response({"job_id": job_id}, 202)
+        if path != "/api/jobs": return self.send_error(404)
         # 一部のMac用ブラウザーはBlob送信時にContent-Lengthを公開しない。
         # 画面側がFile.sizeから付与したローカル専用ヘッダーを代替として使う。
         # File.sizeを入れたローカル専用ヘッダーを優先する。

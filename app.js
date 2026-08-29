@@ -1,6 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null };
-const views = { 1: $('#select-view'), 2: $('#analyze-view'), 3: $('#result-view') };
+const views = { 1: $('#select-view'), 2: $('#analyze-view'), 3: $('#result-view'), 4: $('#rough-analyze-view'), 5: $('#rough-result-view') };
 const phaseProgress = { queued: 5, upload: 12, probing: 20, audio: 36, transcribe: 62, format: 92, complete: 100 };
 const phaseMessages = {
   queued: '処理の準備をしています…', upload: '動画をMac内に読み込みました', probing: '動画情報を確認しています…',
@@ -9,8 +9,8 @@ const phaseMessages = {
 };
 
 function toast(message) { const el = $('#toast'); el.textContent = message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 2200); }
-function showStep(step) {
-  Object.entries(views).forEach(([key, view]) => view.classList.toggle('active-view', Number(key) === step));
+function showStep(view, step = view) {
+  Object.entries(views).forEach(([key, element]) => element.classList.toggle('active-view', Number(key) === view));
   document.querySelectorAll('.step').forEach(el => { const value = Number(el.dataset.step); el.classList.toggle('active', value === step); el.classList.toggle('done', value < step); });
 }
 function formatBytes(bytes) { if (!bytes) return '0 MB'; const mb = bytes / 1024 / 1024; return `${mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb.toFixed(1) + ' MB'}`; }
@@ -52,7 +52,7 @@ async function startAnalysis() {
   try {
     const response = await fetch('/api/jobs', { method:'POST', headers:{'Content-Type':'video/mp4','X-Filename':encodeURIComponent(state.file.name),'X-File-Size':String(state.file.size)}, body:state.file });
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '動画を読み込めませんでした');
-    state.jobId = data.job_id; pollJob();
+    state.jobId = data.job_id; localStorage.setItem('roughCutLastJobId', state.jobId); pollJob();
   } catch (error) { showStep(1); toast(error.message); }
 }
 function setProgress(phase, serverProgress) {
@@ -77,6 +77,43 @@ function renderResults() {
   $('#empty-result').classList.toggle('hidden', segments.length > 0); $('#copy-button').disabled = segments.length === 0;
   const warnings = state.result.warnings || []; $('#warning-banner').classList.toggle('hidden', !warnings.length); $('#warning-banner').textContent = warnings.join(' ');
 }
+
+async function startRoughCuts() {
+  if (!state.jobId) return toast('文字起こし結果を確認できません');
+  showStep(4, 4); setRoughProgress('queued', 5);
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/rough-cuts`, {method:'POST'});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'AI判定を開始できません');
+    pollRoughCuts();
+  } catch (error) { showStep(3, 3); toast(error.message); }
+}
+function setRoughProgress(phase, progress) {
+  const messages = {queued:'ローカルAIを準備しています…',understanding:'動画全体のテーマを読み取っています…',evaluating:'大きく削れそうなまとまりを評価しています…',safety:'必要な本編を削っていないか確認しています…'};
+  const value = Number(progress || 0); $('#rough-progress-bar').style.width = `${value}%`; $('#rough-progress-percent').textContent = `${value}%`; $('#rough-progress-message').textContent = messages[phase] || '分析中です…';
+  const index = {queued:0,understanding:0,evaluating:1,safety:2,complete:2}[phase] ?? 0;
+  $('#rough-analyze-view').querySelectorAll('.process-list span').forEach((el,i) => { el.classList.toggle('active', i === index); el.classList.toggle('done', i < index || phase === 'complete'); });
+}
+async function pollRoughCuts() {
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}`); const data = await response.json(); if (!response.ok) throw new Error(data.error || '状態を取得できません');
+    state.result = data; setRoughProgress(data.rough_phase, data.rough_progress);
+    if (data.rough_status === 'complete') return renderRoughCuts();
+    if (data.rough_status === 'failed') throw new Error(data.rough_error || 'AI判定に失敗しました');
+    state.pollTimer = setTimeout(pollRoughCuts, 1400);
+  } catch (error) { showStep(3, 3); toast(`${error.message}（文字起こしは保存済みです）`); }
+}
+function renderList(selector, values) { $(selector).innerHTML = (values || []).map(value => `<li>${escapeHtml(value)}</li>`).join(''); }
+function renderRoughCuts() {
+  const candidates = state.result.candidates || [], understanding = state.result.video_understanding || {};
+  showStep(5, 4); $('#central-theme').textContent = understanding.central_theme || '—'; renderList('#main-conclusions', understanding.main_conclusions); renderList('#important-points', understanding.important_points);
+  $('#rough-summary').textContent = `高い確信度で大きく削れそうな箇所を${candidates.length}件に絞りました。`;
+  $('#candidate-body').innerHTML = candidates.map((item,index) => `<tr><td><button class="time-button" type="button" data-candidate-index="${index}">${formatPrecise(item.start_seconds)}</button></td><td>${formatPrecise(item.end_seconds)}</td><td>${escapeHtml(item.resume_text || '—')}</td><td><strong>${escapeHtml(item.category)}</strong><br>${escapeHtml(item.reason)}</td></tr>`).join('');
+  $('#empty-candidates').classList.toggle('hidden', candidates.length > 0); $('#copy-candidates-button').disabled = candidates.length === 0;
+}
+async function copyCandidates() {
+  const rows = [['開始','終了','カット終了後の話し始め'], ...(state.result?.candidates || []).map(item => [formatClock(item.start_seconds),formatClock(item.end_seconds),item.resume_text || ''])];
+  const value = rows.map(row => row.join('\t')).join('\n'); try { await navigator.clipboard.writeText(value); } catch { const area=document.createElement('textarea');area.value=value;document.body.append(area);area.select();document.execCommand('copy');area.remove(); } toast('カット指示をコピーしました');
+}
 async function copyResults() {
   const rows = [['開始','終了','発言内容'], ...(state.result?.segments || []).map(item => [formatPrecise(item.start),formatPrecise(item.end),item.text || ''])];
   const text = rows.map(row => row.join('\t')).join('\n'); try { await navigator.clipboard.writeText(text); } catch { const area=document.createElement('textarea');area.value=text;document.body.append(area);area.select();document.execCommand('copy');area.remove(); } toast('タイムコード付き文字起こしをコピーしました');
@@ -86,7 +123,20 @@ $('#drop-zone').addEventListener('click', () => $('#video-input').click()); $('#
 ['dragenter','dragover'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.add('dragover'); }));
 ['dragleave','drop'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.remove('dragover'); })); $('#drop-zone').addEventListener('drop', event => chooseFile(event.dataTransfer.files[0]));
 $('#remove-file').addEventListener('click', clearFile); $('#start-button').addEventListener('click', startAnalysis); $('#copy-button').addEventListener('click', copyResults);
+$('#rough-cut-button').addEventListener('click', startRoughCuts); $('#copy-candidates-button').addEventListener('click', copyCandidates); $('#back-transcript-button').addEventListener('click', () => { renderResults(); showStep(3,3); });
+$('#candidate-body').addEventListener('click', event => { const button=event.target.closest('[data-candidate-index]'); if(!button)return; const item=state.result?.candidates?.[Number(button.dataset.candidateIndex)]; const video=$('#result-video'); if(item&&video.src){video.currentTime=Math.max(0,Number(item.start_seconds)-1);video.play().catch(()=>{});} });
 $('#result-body').addEventListener('click', event => { const button = event.target.closest('[data-segment-index]'); if (!button) return; const segment = state.result?.segments?.[Number(button.dataset.segmentIndex)]; if (!segment) return; const video = $('#result-video'); video.currentTime = Math.max(0, Number(segment.start) - 1); video.play().catch(() => {}); });
 $('#new-video-button').addEventListener('click', () => { clearFile(); state.result=null; state.jobId=null; showStep(1); });
+$('#new-video-from-rough-button').addEventListener('click', () => { clearFile(); state.result=null; state.jobId=null; showStep(1); });
 $('#environment-button').addEventListener('click', () => checkEnvironment(true)); $('#close-dialog').addEventListener('click', () => $('#environment-dialog').close());
-checkEnvironment(false);
+async function restoreSavedJob() {
+  const requested = new URLSearchParams(location.search).get('job') || localStorage.getItem('roughCutLastJobId');
+  if (!requested || !/^[0-9a-f]+$/.test(requested)) return;
+  try {
+    const response = await fetch(`/api/jobs/${requested}`); if (!response.ok) return;
+    const data = await response.json(); if (data.status !== 'complete') return;
+    state.jobId=requested; state.result=data; localStorage.setItem('roughCutLastJobId', requested);
+    if (data.rough_status === 'complete') renderRoughCuts(); else renderResults();
+  } catch {}
+}
+checkEnvironment(false); restoreSavedJob();

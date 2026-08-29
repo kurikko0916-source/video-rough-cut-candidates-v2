@@ -7,7 +7,8 @@
 <nav class="stepper" aria-label="処理ステップ">
   <div class="step active" data-step="1"><span>1</span><div><strong>動画を選ぶ</strong><small>MP4を読み込みます</small></div></div><div class="step-line"></div>
   <div class="step" data-step="2"><span>2</span><div><strong>文字起こし</strong><small>Mac内で音声を文字化</small></div></div><div class="step-line"></div>
-  <div class="step" data-step="3"><span>3</span><div><strong>内容を確認</strong><small>タイムコード付きで確認</small></div></div>
+  <div class="step" data-step="3"><span>3</span><div><strong>文字起こし確認</strong><small>ここで止めてもOK</small></div></div><div class="step-line"></div>
+  <div class="step" data-step="4"><span>4</span><div><strong>粗カット候補</strong><small>任意でAI判定</small></div></div>
 </nav>
 <section id="select-view" class="view active-view">
   <div class="intro"><p class="eyebrow">STEP 1</p><h1>対談動画を選んでください</h1><p>まずは動画全体をタイムコード付きで文字起こしし、精度を確認します。カット判定は行いません。</p></div>
@@ -22,7 +23,13 @@
 <section id="result-view" class="view"><div class="result-heading"><div><p class="eyebrow">STEP 3</p><h1>タイムコード付き文字起こし</h1><p id="result-summary"></p></div><button id="copy-button" class="primary-button compact" type="button">▣ 文字起こしをコピー</button></div>
   <div class="transcript-workspace"><div class="video-panel"><video id="result-video" controls preload="metadata"></video><p>表のタイムコードを押すと、該当発言の少し前から再生します。</p></div><div class="transcript-meta"><div><span>動画の長さ</span><strong id="meta-duration">—</strong></div><div><span>発言数</span><strong id="meta-segments">—</strong></div><div><span>処理時間</span><strong id="meta-processing">—</strong></div><div><span>文字起こしモデル</span><strong id="meta-model">—</strong></div></div></div>
   <div id="warning-banner" class="warning-banner hidden"></div><div class="table-wrap transcript-table"><table><thead><tr><th>開始</th><th>終了</th><th>発言内容</th></tr></thead><tbody id="result-body"></tbody></table><div id="empty-result" class="empty-result hidden"><strong>発言を取得できませんでした</strong><span>音声が入っているか確認してください。</span></div></div>
-  <div class="human-note"><span>ⓘ</span><div><strong>STEP1では文字起こしの精度だけを確認します</strong><small>CUT／KEEP判定や粗カット候補の作成は行っていません。</small></div></div><div class="result-actions"><button id="new-video-button" class="secondary-button" type="button">別の動画を文字起こし</button></div>
+  <div class="human-note"><span>ⓘ</span><div><strong>文字起こしは完了し、Mac内に保存されました</strong><small>ここで止めても大丈夫です。次へ進むと、ローカルAIが高確信度の粗カット候補を探します。</small></div></div><div class="result-actions"><button id="rough-cut-button" class="primary-button" type="button">✦ AIで粗カット候補を作る（任意）</button><button id="new-video-button" class="secondary-button" type="button">別の動画を文字起こし</button></div>
+</section>
+<section id="rough-analyze-view" class="view"><div class="processing-card"><div class="orb"><span></span></div><p class="eyebrow">STEP 4</p><h1>動画全体の価値を分析しています</h1><p id="rough-progress-message">中心テーマを読み取っています…</p><div class="progress-track"><span id="rough-progress-bar"></span></div><strong id="rough-progress-percent">5%</strong><div class="process-list three"><span>テーマを理解</span><span>大きな不要区間を評価</span><span>削りすぎを確認</span></div><p class="wait-note">失敗しても文字起こし結果は消えません。</p></div></section>
+<section id="rough-result-view" class="view"><div class="result-heading"><div><p class="eyebrow">STEP 4</p><h1>AIの粗カット候補</h1><p id="rough-summary"></p></div><button id="copy-candidates-button" class="primary-button compact" type="button">▣ カット指示をコピー</button></div>
+  <div class="understanding-card"><div><span>AIが読み取った中心テーマ</span><h2 id="central-theme"></h2></div><div class="understanding-grid"><div><strong>主な結論</strong><ul id="main-conclusions"></ul></div><div><strong>重要ポイント</strong><ul id="important-points"></ul></div></div></div>
+  <div class="table-wrap candidate-table"><table><thead><tr><th>開始</th><th>終了</th><th>カット終了後の話し始め</th><th>判定理由</th></tr></thead><tbody id="candidate-body"></tbody></table><div id="empty-candidates" class="empty-result hidden"><strong>高い確信度の候補はありませんでした</strong><span>迷う箇所は残す方針です。</span></div></div>
+  <div class="human-note"><span>ⓘ</span><div><strong>これは削除の実行ではなく、AIの提案です</strong><small>必ず動画を確認し、最終判断は人間が行ってください。</small></div></div><div class="result-actions"><button id="back-transcript-button" class="secondary-button" type="button">文字起こしに戻る</button><button id="new-video-from-rough-button" class="secondary-button" type="button">別の動画を読み込む</button></div>
 </section>
 <dialog id="environment-dialog"><div class="dialog-heading"><div><p class="eyebrow">LOCAL TOOLS</p><h2>実行環境</h2></div><button id="close-dialog" class="icon-button" type="button">×</button></div><div id="environment-list" class="environment-list"></div><p class="dialog-note">不足するツールがある場合はREADMEの手順を確認してください。</p></dialog>
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div><script src="app.js"></script></body></html>
