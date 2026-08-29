@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "enabled": false,
+  "channel_name": "",
+  "editing_principles": [],
+  "always_keep_examples": [],
+  "cut_examples": [],
+  "notes": "MVPでは使用しません。将来、チャンネル固有の編集基準をAI判定へ追加するための拡張用データです。"
+}

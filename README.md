@@ -1,3 +1,35 @@
-# 動画編集素材の粗カット候補出し ver.2
+# 粗カットAI
 
-動画編集素材から粗カット候補を出すためのプロジェクトです。
+建築・住宅系YouTubeの日本語対談動画から、明らかな不要箇所の粗カット候補を提案するMac用ローカルアプリです。
+
+## MVPの方針
+
+- 動画・音声・文字起こしはMac内で処理
+- 有料APIは使用しない
+- AIは候補を出すだけで、動画を自動削除しない
+- 迷う箇所は残す
+- Googleスプレッドシートに貼れる3列を出力
+
+## 必要なローカルツール
+
+- Python 3.11以上
+- FFmpeg / ffprobe
+- whisper.cpp (`whisper-cli`)
+- Ollama（未導入時はルール判定のみ）
+
+## 起動
+
+```bash
+python3 server.py
+```
+
+ブラウザーで `http://127.0.0.1:8765` を開きます。
+セットアップ後は `start.command` をダブルクリックしても起動できます。
+
+whisper.cppのモデルを `models/ggml-large-v3-turbo-q5_0.bin` に置くか、環境変数 `WHISPER_MODEL` で指定します。Ollamaのモデル名は `OLLAMA_MODEL` で変更できます（初期値: `qwen3:8b`）。
+
+解析中の一時ファイルと結果は `data/jobs/` へ保存され、GitHubには送られません。
+
+## 将来拡張の入れ物
+
+`config/channel_rules.json` に、将来のチャンネル固有ルール・残す例・カット例を分離して追加できる構造を用意しています。MVPでは無効です。
