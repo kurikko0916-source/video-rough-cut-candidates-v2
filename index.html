@@ -1,27 +1,28 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Mac内で動く日本語対談動画の粗カットAI"><title>粗カットAI</title><link rel="stylesheet" href="styles.css"></head>
+<meta name="description" content="Mac内で動く日本語対談動画の粗カットAI"><title>粗カットAI</title><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="transcript.css"></head>
 <body><header class="app-header"><a class="brand" href="#"><span class="brand-mark">✂</span><span>粗カットAI</span><small>MVP</small></a>
 <button id="environment-button" class="quiet-button" type="button"><span id="environment-dot" class="status-dot"></span>実行環境を確認</button></header>
 <main class="shell">
 <nav class="stepper" aria-label="処理ステップ">
   <div class="step active" data-step="1"><span>1</span><div><strong>動画を選ぶ</strong><small>MP4を読み込みます</small></div></div><div class="step-line"></div>
-  <div class="step" data-step="2"><span>2</span><div><strong>AI解析</strong><small>Mac内で解析します</small></div></div><div class="step-line"></div>
-  <div class="step" data-step="3"><span>3</span><div><strong>候補を確認</strong><small>3列でコピーできます</small></div></div>
+  <div class="step" data-step="2"><span>2</span><div><strong>文字起こし</strong><small>Mac内で音声を文字化</small></div></div><div class="step-line"></div>
+  <div class="step" data-step="3"><span>3</span><div><strong>内容を確認</strong><small>タイムコード付きで確認</small></div></div>
 </nav>
 <section id="select-view" class="view active-view">
-  <div class="intro"><p class="eyebrow">STEP 1</p><h1>対談動画を選んでください</h1><p>明らかな言い直し・仕切り直し・長い無音などを、粗カット候補として提案します。</p></div>
+  <div class="intro"><p class="eyebrow">STEP 1</p><h1>対談動画を選んでください</h1><p>まずは動画全体をタイムコード付きで文字起こしし、精度を確認します。カット判定は行いません。</p></div>
   <input id="video-input" type="file" accept="video/mp4,.mp4" hidden>
   <button id="drop-zone" class="drop-zone" type="button"><span class="file-icon">▶</span><strong>MP4ファイルをここにドロップ</strong><span>または</span><span class="choose-button">動画を選択</span></button>
   <div id="file-card" class="file-card hidden"><div class="file-badge">▶</div><div class="file-copy"><strong id="file-name"></strong><span id="file-meta">動画情報を確認中…</span></div><button id="remove-file" class="icon-button" type="button">×</button></div>
   <div class="privacy-note"><span>✓</span><div><strong>動画はMac内だけで処理します</strong><small>外部へアップロードせず、API料金もかかりません。</small></div></div>
-  <button id="start-button" class="primary-button" type="button" disabled><span>✦</span> 解析を開始</button>
+  <button id="start-button" class="primary-button" type="button" disabled><span>✦</span> 文字起こしを開始</button>
 </section>
-<section id="analyze-view" class="view"><div class="processing-card"><div class="orb"><span></span></div><p class="eyebrow">STEP 2</p><h1>粗カット候補を探しています</h1><p id="progress-message">動画を準備中です…</p><div class="progress-track"><span id="progress-bar"></span></div><strong id="progress-percent">0%</strong>
-  <div class="process-list"><span data-phase="upload">動画を読み込む</span><span data-phase="audio">音声を取り出す</span><span data-phase="transcribe">日本語を文字起こし</span><span data-phase="analyze">AIが候補を判定</span></div><p class="wait-note">処理時間は動画の長さによって変わります。この画面を閉じずにお待ちください。</p></div></section>
-<section id="result-view" class="view"><div class="result-heading"><div><p class="eyebrow">STEP 3</p><h1>粗カット候補</h1><p id="result-summary"></p></div><button id="copy-button" class="primary-button compact" type="button">▣ スプレッドシート用にコピー</button></div>
-  <div id="warning-banner" class="warning-banner hidden"></div><div class="table-wrap"><table><thead><tr><th>開始</th><th>終了</th><th>カット終了後の話し始め</th></tr></thead><tbody id="result-body"></tbody></table><div id="empty-result" class="empty-result hidden"><strong>高い確信度の候補はありませんでした</strong><span>迷う箇所は無理に候補化していません。</span></div></div>
-  <div class="human-note"><span>⛨</span><div><strong>候補を確認してから使用してください</strong><small>AIは候補を出すだけで、動画を自動削除しません。最終判断は必ず人間が行ってください。</small></div></div><div class="result-actions"><button id="new-video-button" class="secondary-button" type="button">別の動画を解析</button></div>
+<section id="analyze-view" class="view"><div class="processing-card"><div class="orb"><span></span></div><p class="eyebrow">STEP 2</p><h1>動画全体を文字起こししています</h1><p id="progress-message">動画を準備中です…</p><div class="progress-track"><span id="progress-bar"></span></div><strong id="progress-percent">0%</strong>
+  <div class="process-list three"><span data-phase="upload">動画を読み込む</span><span data-phase="audio">音声を取り出す</span><span data-phase="transcribe">日本語を文字起こし</span></div><p class="wait-note">処理時間は動画の長さによって変わります。この画面を閉じずにお待ちください。</p></div></section>
+<section id="result-view" class="view"><div class="result-heading"><div><p class="eyebrow">STEP 3</p><h1>タイムコード付き文字起こし</h1><p id="result-summary"></p></div><button id="copy-button" class="primary-button compact" type="button">▣ 文字起こしをコピー</button></div>
+  <div class="transcript-workspace"><div class="video-panel"><video id="result-video" controls preload="metadata"></video><p>表のタイムコードを押すと、該当発言の少し前から再生します。</p></div><div class="transcript-meta"><div><span>動画の長さ</span><strong id="meta-duration">—</strong></div><div><span>発言数</span><strong id="meta-segments">—</strong></div><div><span>処理時間</span><strong id="meta-processing">—</strong></div><div><span>文字起こしモデル</span><strong id="meta-model">—</strong></div></div></div>
+  <div id="warning-banner" class="warning-banner hidden"></div><div class="table-wrap transcript-table"><table><thead><tr><th>開始</th><th>終了</th><th>発言内容</th></tr></thead><tbody id="result-body"></tbody></table><div id="empty-result" class="empty-result hidden"><strong>発言を取得できませんでした</strong><span>音声が入っているか確認してください。</span></div></div>
+  <div class="human-note"><span>ⓘ</span><div><strong>STEP1では文字起こしの精度だけを確認します</strong><small>CUT／KEEP判定や粗カット候補の作成は行っていません。</small></div></div><div class="result-actions"><button id="new-video-button" class="secondary-button" type="button">別の動画を文字起こし</button></div>
 </section>
 <dialog id="environment-dialog"><div class="dialog-heading"><div><p class="eyebrow">LOCAL TOOLS</p><h2>実行環境</h2></div><button id="close-dialog" class="icon-button" type="button">×</button></div><div id="environment-list" class="environment-list"></div><p class="dialog-note">不足するツールがある場合はREADMEの手順を確認してください。</p></dialog>
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div><script src="app.js"></script></body></html>

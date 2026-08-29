@@ -231,6 +231,7 @@ def analyze_job(job_id: str) -> None:
     job_dir = JOBS_DIR / job_id
     video = job_dir / "input.mp4"
     audio = job_dir / "audio.wav"
+    started_at = time.time()
     try:
         env = environment()["tools"]
         missing = [name for name in ("ffmpeg", "ffprobe", "whisper", "whisper_model") if not env[name]["ready"]]
@@ -242,15 +243,16 @@ def analyze_job(job_id: str) -> None:
         update(job_id, phase="transcribe", progress=45)
         segments = transcribe(audio, job_dir, env["whisper"]["path"], whisper_model())
         (job_dir / "segments.json").write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
-        update(job_id, phase="analyze", progress=72)
-        candidates = rule_candidates(segments, silences)
-        warnings = []
-        model = os.getenv("OLLAMA_MODEL", "qwen3:4b")
-        if ollama_available(model): candidates.extend(llm_candidates(segments, model))
-        else: warnings.append("Ollamaのモデルが起動していないため、今回は明示的な仕切り直しと無音を中心に判定しました。")
-        update(job_id, phase="merge", progress=91)
-        candidates = snap_and_merge(candidates, segments, metadata["duration_seconds"])
-        result = {"candidates": candidates, "warnings": warnings, "transcript_segments": len(segments), **metadata}
+        update(job_id, phase="format", progress=92)
+        result = {
+            "segments": segments,
+            "transcript_segments": len(segments),
+            "processing_seconds": round(time.time() - started_at, 1),
+            "transcription_model": whisper_model().stem.replace("ggml-", ""),
+            "language": "ja",
+            "warnings": [],
+            **metadata,
+        }
         (job_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         update(job_id, status="complete", phase="complete", progress=100, **result)
     except Exception as error:
@@ -274,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             job_id = path.rsplit("/", 1)[-1]
             with LOCK: job = dict(JOBS.get(job_id, {}))
             return self.json_response(job or {"error": "処理情報が見つかりません。"}, 200 if job else 404)
-        files = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/app.js": "app.js"}
+        files = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/transcript.css": "transcript.css", "/app.js": "app.js"}
         filename = files.get(path)
         if not filename: return self.send_error(404)
         data = (ROOT / filename).read_bytes(); content_type = "text/html; charset=utf-8" if filename.endswith("html") else "text/css; charset=utf-8" if filename.endswith("css") else "application/javascript; charset=utf-8"
