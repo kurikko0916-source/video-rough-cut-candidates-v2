@@ -46,7 +46,7 @@ async function startAnalysis() {
   if (!ready) { await checkEnvironment(true); return toast('必要なローカルツールを準備してください'); }
   showStep(2); setProgress('upload', 4);
   try {
-    const response = await fetch('/api/jobs', { method:'POST', headers:{'Content-Type':'video/mp4','X-Filename':encodeURIComponent(state.file.name)}, body:state.file });
+    const response = await fetch('/api/jobs', { method:'POST', headers:{'Content-Type':'video/mp4','X-Filename':encodeURIComponent(state.file.name),'X-File-Size':String(state.file.size)}, body:state.file });
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '動画を読み込めませんでした');
     state.jobId = data.job_id; pollJob();
   } catch (error) { showStep(1); toast(error.message); }

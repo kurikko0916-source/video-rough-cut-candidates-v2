@@ -281,7 +281,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_POST(self):
         if urlparse(self.path).path != "/api/jobs": return self.send_error(404)
-        try: size = int(self.headers.get("Content-Length", "0"))
+        # 一部のMac用ブラウザーはBlob送信時にContent-Lengthを公開しない。
+        # 画面側がFile.sizeから付与したローカル専用ヘッダーを代替として使う。
+        try: size = int(self.headers.get("Content-Length") or self.headers.get("X-File-Size") or "0")
         except ValueError: size = 0
         if size <= 0 or size > MAX_UPLOAD_BYTES: return self.json_response({"error": "動画のファイル容量を確認できません。"}, 400)
         filename = unquote(self.headers.get("X-Filename", "video.mp4"))
