@@ -1,5 +1,5 @@
 const $ = selector => document.querySelector(selector);
-const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null, cloudMode: false };
+const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null, cloudMode: false, bridgeMode: false };
 const views = { 1: $('#select-view'), 2: $('#analyze-view'), 3: $('#result-view'), 4: $('#rough-analyze-view'), 5: $('#rough-result-view') };
 const phaseProgress = { queued: 5, upload: 12, probing: 20, audio: 36, transcribe: 62, format: 92, complete: 100 };
 const phaseMessages = {
@@ -43,7 +43,11 @@ async function checkEnvironment(showDialog = false) {
   try {
     const response = await fetch('/api/health'); const data = await response.json(); const tools = data.tools || {};
     state.cloudMode = Boolean(data.cloud_mode);
-    const requiredReady = state.cloudMode || (tools.ffmpeg?.ready && tools.ffprobe?.ready && tools.whisper?.ready && tools.whisper_model?.ready);
+    state.bridgeMode = Boolean(data.bridge_mode);
+    const requiredReady = state.cloudMode || (state.bridgeMode ? tools.ffmpeg?.ready : (tools.ffmpeg?.ready && tools.ffprobe?.ready && tools.whisper?.ready && tools.whisper_model?.ready));
+    const privacy = $('#privacy-description');
+    if (privacy && state.bridgeMode) privacy.textContent = '映像はMac内で音声に変換し、軽い音声データだけをクラウドへ送ります。';
+    else if (privacy && state.cloudMode) privacy.textContent = '選んだ動画を暗号化通信でクラウドへ送り、処理後に削除します。';
     $('#environment-dot').className = `status-dot ${requiredReady ? 'ready' : 'error'}`;
     if (showDialog) {
       const labels = { ffmpeg:'FFmpeg（音声抽出）', ffprobe:'ffprobe（動画情報）', whisper:'whisper.cpp（文字起こし）', whisper_model:'Whisperモデル' };

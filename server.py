@@ -25,6 +25,7 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 GCP_PROJECT = os.getenv("GCP_PROJECT", "")
 GCP_REGION = os.getenv("GCP_REGION", "asia-northeast1")
 CLOUD_RUN_JOB_NAME = os.getenv("CLOUD_RUN_JOB_NAME", "video-rough-cut-worker")
+CLOUD_BRIDGE_URL = os.getenv("CLOUD_BRIDGE_URL", "").rstrip("/")
 HOST = "0.0.0.0" if CLOUD_MODE else "127.0.0.1"
 PORT = int(os.getenv("PORT", "8765"))
 # 高画質の収録素材は30分程度でも20GBを超えることがある。
@@ -71,6 +72,19 @@ def trigger_cloud_worker(job_id: str, object_name: str = "", mode: str = "transc
     response.raise_for_status()
 
 
+def remote_json(path: str, payload: dict | None = None, method: str | None = None, timeout: int = 60) -> dict:
+    """Mac高速モードからCloud Runの小さなJSON APIだけを呼ぶ。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = Request(
+        CLOUD_BRIDGE_URL + path,
+        data=body,
+        headers={"Content-Type": "application/json"} if body is not None else {},
+        method=method or ("POST" if body is not None else "GET"),
+    )
+    with urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
 def tool_path(env_name: str, default_name: str) -> str | None:
     configured = os.getenv(env_name)
     if configured and Path(configured).exists(): return configured
@@ -95,7 +109,7 @@ def environment() -> dict:
     whisper = tool_path("WHISPER_BIN", "whisper-cli")
     ollama = tool_path("OLLAMA_BIN", "ollama")
     model = whisper_model()
-    return {"cloud_mode": CLOUD_MODE, "tools": {
+    return {"cloud_mode": CLOUD_MODE, "bridge_mode": bool(CLOUD_BRIDGE_URL), "tools": {
         "ffmpeg": {"ready": bool(ffmpeg), "path": ffmpeg}, "ffprobe": {"ready": bool(ffprobe), "path": ffprobe},
         "whisper": {"ready": bool(whisper), "path": whisper}, "whisper_model": {"ready": model.is_file(), "path": str(model)},
         "ollama": {"ready": bool(ollama), "path": ollama},
@@ -123,6 +137,13 @@ def load_job(job_id: str) -> dict:
             pass
     with LOCK:
         current = dict(JOBS.get(job_id, {}))
+    if CLOUD_BRIDGE_URL and current.get("cloud_started"):
+        try:
+            remote = remote_json(f"/api/jobs/{job_id}")
+            with LOCK: JOBS[job_id] = {**current, **remote, "cloud_started": True}
+            return dict(JOBS[job_id])
+        except Exception:
+            return current
     if current:
         return current
     status_path = JOBS_DIR / job_id / "status.json"
@@ -189,7 +210,8 @@ def timestamp_seconds(value) -> float:
 
 
 def parse_whisper_json(path: Path) -> list[dict]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    # whisper.cppが固有名詞付近に不正なUTF-8バイトを出しても、結果全体を失わない。
+    data = json.loads(path.read_bytes().decode("utf-8", errors="replace"))
     source = data.get("transcription") or data.get("segments") or []
     segments = []
     for item in source:
@@ -645,6 +667,31 @@ def run_cloud_worker() -> None:
         if ollama_process: ollama_process.terminate()
 
 
+def bridge_audio_to_cloud(job_id: str, video: Path, source_filename: str) -> None:
+    """Macで映像を音声へ縮小し、音声だけをCloud Runへ渡す。"""
+    job_dir = video.parent
+    audio = job_dir / "audio.m4a"
+    try:
+        ffmpeg = environment()["tools"]["ffmpeg"]["path"]
+        if not ffmpeg: raise RuntimeError("Mac内のFFmpegが見つかりません。")
+        update(job_id, phase="audio", progress=18)
+        run([ffmpeg, "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "64k", str(audio)], "動画から音声を取り出せませんでした。")
+        update(job_id, phase="upload", progress=28)
+        session = remote_json("/api/uploads", {
+            "job_id": job_id, "filename": "audio.m4a", "source_filename": source_filename,
+            "size": audio.stat().st_size, "content_type": "audio/mp4", "media_kind": "audio",
+        })
+        request = Request(session["upload_url"], data=audio.read_bytes(), headers={"Content-Type": "audio/mp4"}, method="PUT")
+        with urlopen(request, timeout=1800) as response: response.read()
+        remote_json("/api/jobs", {"job_id": job_id, "object_name": session["object_name"]})
+        update(job_id, status="processing", phase="upload", progress=10, cloud_started=True)
+    except Exception as error:
+        update(job_id, status="failed", phase="failed", progress=0, error=str(error))
+    finally:
+        audio.unlink(missing_ok=True)
+        video.unlink(missing_ok=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RoughCutAI/0.1"
     def log_message(self, format, *args): print(f"[{self.log_date_time_string()}] {format % args}")
@@ -673,13 +720,18 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 filename = str(payload.get("filename") or "video.mp4")
+                source_filename = str(payload.get("source_filename") or filename)
                 size = int(payload.get("size") or 0)
                 if size <= 0 or size > MAX_UPLOAD_BYTES: raise ValueError("動画のファイル容量が不正です。")
-                if not filename.lower().endswith(".mp4"): raise ValueError("MP4動画を選んでください。")
-                job_id = uuid.uuid4().hex
-                with LOCK: JOBS[job_id] = {"job_id": job_id, "filename": filename, "status": "uploading", "phase": "upload", "progress": 3, "created_at": time.time()}
+                media_kind = str(payload.get("media_kind") or "video")
+                if media_kind == "video" and not filename.lower().endswith(".mp4"): raise ValueError("MP4動画を選んでください。")
+                if media_kind == "audio" and not filename.lower().endswith((".m4a", ".mp4", ".wav")): raise ValueError("対応していない音声形式です。")
+                requested_id = str(payload.get("job_id") or "")
+                job_id = requested_id if re.fullmatch(r"[0-9a-f]{32}", requested_id) else uuid.uuid4().hex
+                with LOCK: JOBS[job_id] = {"job_id": job_id, "filename": source_filename, "status": "uploading", "phase": "upload", "progress": 3, "created_at": time.time()}
                 upload_status(job_id, JOBS[job_id])
-                object_name, upload_url = create_resumable_upload(job_id, filename, size, "video/mp4")
+                content_type = str(payload.get("content_type") or ("audio/mp4" if media_kind == "audio" else "video/mp4"))
+                object_name, upload_url = create_resumable_upload(job_id, filename, size, content_type)
                 return self.json_response({"job_id": job_id, "object_name": object_name, "upload_url": upload_url})
             except Exception as error:
                 return self.json_response({"error": str(error)}, 400)
@@ -693,6 +745,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response({"job_id": job_id}, 202)
             update(job_id, rough_status="processing", rough_phase="queued", rough_progress=5, rough_error=None)
             if CLOUD_MODE: trigger_cloud_worker(job_id, mode="rough")
+            elif CLOUD_BRIDGE_URL:
+                try: remote_json(path, {}, "POST")
+                except Exception as error: return self.json_response({"error": str(error)}, 400)
             else: threading.Thread(target=run_rough_cut_analysis, args=(job_id,), daemon=True).start()
             return self.json_response({"job_id": job_id}, 202)
         if path != "/api/jobs": return self.send_error(404)
@@ -733,7 +788,10 @@ class Handler(BaseHTTPRequestHandler):
                 output.write(chunk); remaining -= len(chunk)
         if remaining: shutil.rmtree(job_dir, ignore_errors=True); return self.json_response({"error": "動画の読み込みが途中で終了しました。"}, 400)
         with LOCK: JOBS[job_id] = {"job_id": job_id, "filename": filename, "status": "processing", "phase": "upload", "progress": 10, "created_at": time.time()}
-        threading.Thread(target=analyze_job, args=(job_id,), daemon=True).start()
+        if CLOUD_BRIDGE_URL:
+            threading.Thread(target=bridge_audio_to_cloud, args=(job_id, target, filename), daemon=True).start()
+        else:
+            threading.Thread(target=analyze_job, args=(job_id,), daemon=True).start()
         self.json_response({"job_id": job_id}, 202)
 
 

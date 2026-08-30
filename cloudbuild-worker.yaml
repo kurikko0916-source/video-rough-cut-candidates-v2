@@ -1,0 +1,7 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, --target, worker, -t, asia-northeast1-docker.pkg.dev/$PROJECT_ID/video-rough-cut/worker:$BUILD_ID, .]
+  - name: gcr.io/cloud-builders/docker
+    args: [push, asia-northeast1-docker.pkg.dev/$PROJECT_ID/video-rough-cut/worker:$BUILD_ID]
+images:
+  - asia-northeast1-docker.pkg.dev/$PROJECT_ID/video-rough-cut/worker:$BUILD_ID

@@ -28,6 +28,8 @@
 
 `start.command` をダブルクリックします。Ollamaとアプリが自動起動し、ブラウザーで `http://127.0.0.1:8765` が開きます。
 
+15GB級の素材をCloud版で使う場合は、`高速文字起こし.command` をダブルクリックします。操作は同じくMP4を選ぶだけですが、Mac内で音声へ縮小し、数十MBの音声だけをCloud Runへ送ります。
+
 whisper.cppのモデルを `models/ggml-large-v3-turbo-q5_0.bin` に置くか、環境変数 `WHISPER_MODEL` で指定します。Ollamaのモデル名は `OLLAMA_MODEL` で変更できます（初期値: `qwen3:4b`）。
 
 解析中の一時ファイルと結果は `data/jobs/` へ保存され、GitHubには送られません。
