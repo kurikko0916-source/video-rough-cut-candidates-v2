@@ -1,4 +1,5 @@
 .process-list.three{grid-template-columns:repeat(3,1fr)}
+.processing-card .process-list:not(.three){grid-template-columns:repeat(5,1fr)}
 .transcript-workspace{margin-bottom:18px;display:grid;grid-template-columns:minmax(480px,1.4fr) minmax(260px,.6fr);gap:16px}
 .video-panel,.transcript-meta{border:1px solid var(--line);border-radius:15px;background:var(--panel)}
 .video-panel{padding:14px}.video-panel video{width:100%;max-height:390px;display:block;border-radius:10px;background:#02050a}.video-panel p{margin:11px 4px 0;color:var(--muted);font-size:11px;text-align:center}

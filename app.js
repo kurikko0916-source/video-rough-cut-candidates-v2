@@ -1,11 +1,11 @@
 const $ = selector => document.querySelector(selector);
-const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null, cloudMode: false, bridgeMode: false };
+const state = { file: null, fileMeta: null, selectionId: null, videoUrl: null, jobId: null, result: null, pollTimer: null, cloudMode: false, bridgeMode: false, localDirectMode: false };
 const views = { 1: $('#select-view'), 2: $('#analyze-view'), 3: $('#result-view'), 4: $('#rough-analyze-view'), 5: $('#rough-result-view') };
 const phaseProgress = { queued: 5, upload: 12, probing: 20, audio: 36, transcribe: 62, format: 92, complete: 100 };
 const phaseMessages = {
   queued: '処理の準備をしています…', upload: '動画をMac内に読み込みました', probing: '動画情報を確認しています…',
   audio: '文字起こし用の音声を取り出しています…', transcribe: '日本語の会話を文字起こししています…',
-  format: 'タイムコード付きの表に整えています…', complete: '文字起こしが完了しました'
+  vad: '発話区間と非発話区間を確認しています…', take_detection: '言い直し・重複テイクの確認候補を探しています…', format: 'タイムコード付きの表に整えています…', complete: '文字起こしが完了しました'
 };
 
 function toast(message) { const el = $('#toast'); el.textContent = message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 2200); }
@@ -37,16 +37,39 @@ function chooseFile(file) {
   $('#file-card').classList.remove('hidden'); $('#start-button').disabled = false;
   const video = document.createElement('video'); video.preload = 'metadata'; video.onloadedmetadata = () => { $('#file-meta').textContent = `${formatClock(video.duration)} ・ ${formatBytes(file.size)} ・ MP4`; }; video.src = state.videoUrl;
 }
-function clearFile() { if (state.videoUrl) URL.revokeObjectURL(state.videoUrl); state.file = null; state.videoUrl = null; $('#video-input').value = ''; $('#file-card').classList.add('hidden'); $('#start-button').disabled = true; $('#result-video').removeAttribute('src'); }
+async function chooseLocalFile() {
+  try {
+    const response = await fetch('/api/local-select', {method:'POST'});
+    const data = await response.json();
+    if (!response.ok) {
+      if (String(data.error || '').includes('キャンセル')) return;
+      throw new Error(data.error || '動画を選択できませんでした');
+    }
+    state.file = null; state.selectionId = data.selection_id; state.fileMeta = data;
+    state.videoUrl = `/api/local-media/${data.selection_id}`;
+    $('#file-name').textContent = data.filename;
+    $('#file-meta').textContent = `${formatClock(data.duration_seconds)} ・ ${formatBytes(data.size)} ・ MP4`;
+    $('#file-card').classList.remove('hidden'); $('#start-button').disabled = false;
+  } catch (error) { toast(error.message); }
+}
+function clearFile() {
+  if (state.videoUrl?.startsWith('blob:')) URL.revokeObjectURL(state.videoUrl);
+  state.file = null; state.fileMeta = null; state.selectionId = null; state.videoUrl = null;
+  $('#video-input').value = ''; $('#file-card').classList.add('hidden'); $('#start-button').disabled = true; $('#result-video').removeAttribute('src');
+}
 
 async function checkEnvironment(showDialog = false) {
   try {
     const response = await fetch('/api/health'); const data = await response.json(); const tools = data.tools || {};
     state.cloudMode = Boolean(data.cloud_mode);
     state.bridgeMode = Boolean(data.bridge_mode);
+    state.localDirectMode = Boolean(data.local_direct_mode);
+    $('#select-title').textContent = state.localDirectMode ? 'MacからMP4動画を選択' : 'MP4ファイルをここにドロップ';
+    $('#select-description').textContent = state.localDirectMode ? '元動画はコピーせず、そのまま読み取ります' : 'または';
     const requiredReady = state.cloudMode || (state.bridgeMode ? tools.ffmpeg?.ready : (tools.ffmpeg?.ready && tools.ffprobe?.ready && tools.whisper?.ready && tools.whisper_model?.ready));
     const privacy = $('#privacy-description');
-    if (privacy && state.bridgeMode) privacy.textContent = '映像はMac内で音声に変換し、軽い音声データだけをクラウドへ送ります。';
+    if (privacy && state.localDirectMode) privacy.textContent = '元動画をコピーせず、Mac内で読み取り専用として直接解析します。外部通信は行いません。';
+    else if (privacy && state.bridgeMode) privacy.textContent = '映像はMac内で音声に変換し、軽い音声データだけをクラウドへ送ります。';
     else if (privacy && state.cloudMode) privacy.textContent = '選んだ動画を暗号化通信でクラウドへ送り、処理後に削除します。';
     $('#environment-dot').className = `status-dot ${requiredReady ? 'ready' : 'error'}`;
     if (showDialog) {
@@ -59,13 +82,15 @@ async function checkEnvironment(showDialog = false) {
 }
 
 async function startAnalysis() {
-  if (!state.file) return;
+  if (!state.file && !state.selectionId) return;
   const ready = await checkEnvironment(false);
   if (!ready) { await checkEnvironment(true); return toast('必要なローカルツールを準備してください'); }
   showStep(2); setProgress('upload', 4);
   try {
     let response;
-    if (state.cloudMode) {
+    if (state.localDirectMode) {
+      response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({selection_id:state.selectionId})});
+    } else if (state.cloudMode) {
       const sessionResponse = await fetch('/api/uploads', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:state.file.name,size:state.file.size})});
       const session = await sessionResponse.json(); if (!sessionResponse.ok) throw new Error(session.error || 'アップロードを準備できませんでした');
       setProgress('upload', 7);
@@ -81,7 +106,7 @@ async function startAnalysis() {
 }
 function setProgress(phase, serverProgress) {
   const progress = Number(serverProgress ?? phaseProgress[phase] ?? 0); $('#progress-bar').style.width = `${progress}%`; $('#progress-percent').textContent = `${progress}%`; $('#progress-message').textContent = phaseMessages[phase] || '処理中です…';
-  const order = ['upload','audio','transcribe']; const current = Math.max(0, order.indexOf(phase === 'probing' ? 'upload' : phase === 'format' ? 'transcribe' : phase));
+  const order = ['upload','audio','transcribe','vad','take_detection']; const normalizedPhase = phase === 'probing' ? 'upload' : phase === 'format' ? 'take_detection' : phase; const current = Math.max(0, order.indexOf(normalizedPhase));
   document.querySelectorAll('.process-list span').forEach((el,index) => { el.classList.toggle('active', index === current); el.classList.toggle('done', index < current || phase === 'complete'); });
 }
 async function pollJob() {
@@ -94,7 +119,7 @@ async function pollJob() {
   } catch (error) { showStep(1); toast(error.message); }
 }
 function renderResults() {
-  const segments = state.result.segments || []; showStep(3); $('#result-summary').textContent = `${state.result.filename || state.file?.name} の全体を ${segments.length}個の発言として文字起こししました。`;
+  const segments = state.result.segments || [], takeCount = state.result.take_detection?.candidates?.length || 0; showStep(3); $('#result-summary').textContent = `${state.result.filename || state.result.source?.filename || state.fileMeta?.filename || state.file?.name} の全体を ${segments.length}個の発言として文字起こししました。言い直し・重複の確認候補は${takeCount}件です。`;
   $('#result-video').src = state.videoUrl || '';
   $('#meta-duration').textContent = formatClock(state.result.duration_seconds); $('#meta-segments').textContent = `${segments.length}件`; $('#meta-processing').textContent = formatElapsed(state.result.processing_seconds); $('#meta-model').textContent = state.result.transcription_model || '—';
   $('#result-body').innerHTML = segments.map((item,index) => `<tr><td><button class="time-button" type="button" data-segment-index="${index}">${formatPrecise(item.start)}</button></td><td>${formatPrecise(item.end)}</td><td>${escapeHtml(item.text)}</td></tr>`).join('');
@@ -148,7 +173,7 @@ function downloadSrt() {
   const segments = (state.result?.segments || []).filter(item => String(item.text || '').trim());
   if (!segments.length) return toast('保存できる文字起こしがありません');
   const srt = segments.map((item, index) => `${index + 1}\n${formatSrtTime(item.start)} --> ${formatSrtTime(item.end)}\n${String(item.text).trim()}`).join('\n\n') + '\n';
-  const sourceName = state.result?.filename || state.file?.name || '文字起こし';
+  const sourceName = state.result?.filename || state.result?.source?.filename || state.fileMeta?.filename || state.file?.name || '文字起こし';
   const baseName = sourceName.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_');
   const blob = new Blob(['\uFEFF', srt], {type:'application/x-subrip;charset=utf-8'});
   const url = URL.createObjectURL(blob);
@@ -159,10 +184,31 @@ function downloadSrt() {
   toast('Vrew用SRTを保存しました');
 }
 
-$('#drop-zone').addEventListener('click', () => $('#video-input').click()); $('#video-input').addEventListener('change', event => chooseFile(event.target.files[0]));
+function downloadJson() {
+  const result = state.result;
+  if (!result?.segments?.length) return toast('保存できる文字起こしがありません');
+  const sourceName = result.filename || result.source?.filename || state.fileMeta?.filename || state.file?.name || '文字起こし';
+  const baseName = sourceName.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_');
+  const payload = {
+    schema_version: result.schema_version || '1.0',
+    source: {...(result.source || {}), filename: result.source?.filename || sourceName, duration_seconds: result.duration_seconds, fps: result.source_fps, fps_ratio: result.source_fps_ratio},
+    transcription: {engine:'whisper.cpp', model:result.transcription_model, language:result.language || 'ja', processed_locally:Boolean(result.processed_locally)},
+    segments: result.segments,
+    audio_activity: result.audio_activity || null,
+    take_detection: result.take_detection || null,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json;charset=utf-8'});
+  const url = URL.createObjectURL(blob); const link = document.createElement('a');
+  link.href = url; link.download = `${baseName}_文字起こし.json`;
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('後続処理用JSONを保存しました');
+}
+
+$('#drop-zone').addEventListener('click', async () => { await checkEnvironment(false); if (state.localDirectMode) chooseLocalFile(); else $('#video-input').click(); }); $('#video-input').addEventListener('change', event => chooseFile(event.target.files[0]));
 ['dragenter','dragover'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.add('dragover'); }));
-['dragleave','drop'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.remove('dragover'); })); $('#drop-zone').addEventListener('drop', event => chooseFile(event.dataTransfer.files[0]));
-$('#remove-file').addEventListener('click', clearFile); $('#start-button').addEventListener('click', startAnalysis); $('#copy-button').addEventListener('click', copyResults); $('#download-srt-button').addEventListener('click', downloadSrt); $('#rough-download-srt-button').addEventListener('click', downloadSrt);
+['dragleave','drop'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.remove('dragover'); })); $('#drop-zone').addEventListener('drop', event => { if (state.localDirectMode) toast('大容量動画は「動画を選択」から指定してください'); else chooseFile(event.dataTransfer.files[0]); });
+$('#remove-file').addEventListener('click', clearFile); $('#start-button').addEventListener('click', startAnalysis); $('#copy-button').addEventListener('click', copyResults); $('#download-srt-button').addEventListener('click', downloadSrt); $('#download-json-button').addEventListener('click', downloadJson); $('#rough-download-srt-button').addEventListener('click', downloadSrt);
 $('#rough-cut-button').addEventListener('click', startRoughCuts); $('#copy-candidates-button').addEventListener('click', copyCandidates); $('#back-transcript-button').addEventListener('click', () => { renderResults(); showStep(3,3); });
 $('#candidate-body').addEventListener('click', event => { const button=event.target.closest('[data-candidate-index]'); if(!button)return; const item=state.result?.candidates?.[Number(button.dataset.candidateIndex)]; const video=$('#result-video'); if(item&&video.src){video.currentTime=Math.max(0,Number(item.start_seconds)-1);video.play().catch(()=>{});} });
 $('#result-body').addEventListener('click', event => { const button = event.target.closest('[data-segment-index]'); if (!button) return; const segment = state.result?.segments?.[Number(button.dataset.segmentIndex)]; if (!segment) return; const video = $('#result-video'); video.currentTime = Math.max(0, Number(segment.start) - 1); video.play().catch(() => {}); });
