@@ -1,5 +1,5 @@
 const $ = selector => document.querySelector(selector);
-const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null };
+const state = { file: null, videoUrl: null, jobId: null, result: null, pollTimer: null, cloudMode: false };
 const views = { 1: $('#select-view'), 2: $('#analyze-view'), 3: $('#result-view'), 4: $('#rough-analyze-view'), 5: $('#rough-result-view') };
 const phaseProgress = { queued: 5, upload: 12, probing: 20, audio: 36, transcribe: 62, format: 92, complete: 100 };
 const phaseMessages = {
@@ -16,6 +16,15 @@ function showStep(view, step = view) {
 function formatBytes(bytes) { if (!bytes) return '0 MB'; const mb = bytes / 1024 / 1024; return `${mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb.toFixed(1) + ' MB'}`; }
 function formatClock(seconds) { const safe = Math.max(0, Number(seconds) || 0); const h = Math.floor(safe / 3600); const m = Math.floor((safe % 3600) / 60); const s = Math.floor(safe % 60); return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`; }
 function formatPrecise(seconds) { const centiseconds = Math.round(Math.max(0, Number(seconds) || 0) * 100); return `${formatClock(Math.floor(centiseconds / 100))}.${String(centiseconds % 100).padStart(2,'0')}`; }
+function formatSrtTime(seconds) {
+  const totalMilliseconds = Math.round(Math.max(0, Number(seconds) || 0) * 1000);
+  const milliseconds = totalMilliseconds % 1000;
+  const totalSeconds = Math.floor(totalMilliseconds / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  return `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(secs).padStart(2,'0')},${String(milliseconds).padStart(3,'0')}`;
+}
 function formatElapsed(seconds) { const value = Math.round(Number(seconds) || 0); return value >= 60 ? `${Math.floor(value / 60)}分${value % 60}秒` : `${value}秒`; }
 function escapeHtml(value) { return String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 
@@ -33,7 +42,8 @@ function clearFile() { if (state.videoUrl) URL.revokeObjectURL(state.videoUrl); 
 async function checkEnvironment(showDialog = false) {
   try {
     const response = await fetch('/api/health'); const data = await response.json(); const tools = data.tools || {};
-    const requiredReady = tools.ffmpeg?.ready && tools.ffprobe?.ready && tools.whisper?.ready && tools.whisper_model?.ready;
+    state.cloudMode = Boolean(data.cloud_mode);
+    const requiredReady = state.cloudMode || (tools.ffmpeg?.ready && tools.ffprobe?.ready && tools.whisper?.ready && tools.whisper_model?.ready);
     $('#environment-dot').className = `status-dot ${requiredReady ? 'ready' : 'error'}`;
     if (showDialog) {
       const labels = { ffmpeg:'FFmpeg（音声抽出）', ffprobe:'ffprobe（動画情報）', whisper:'whisper.cpp（文字起こし）', whisper_model:'Whisperモデル' };
@@ -50,7 +60,17 @@ async function startAnalysis() {
   if (!ready) { await checkEnvironment(true); return toast('必要なローカルツールを準備してください'); }
   showStep(2); setProgress('upload', 4);
   try {
-    const response = await fetch('/api/jobs', { method:'POST', headers:{'Content-Type':'video/mp4','X-Filename':encodeURIComponent(state.file.name),'X-File-Size':String(state.file.size)}, body:state.file });
+    let response;
+    if (state.cloudMode) {
+      const sessionResponse = await fetch('/api/uploads', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:state.file.name,size:state.file.size})});
+      const session = await sessionResponse.json(); if (!sessionResponse.ok) throw new Error(session.error || 'アップロードを準備できませんでした');
+      setProgress('upload', 7);
+      const uploadResponse = await fetch(session.upload_url, {method:'PUT', headers:{'Content-Type':'video/mp4'}, body:state.file});
+      if (!uploadResponse.ok) throw new Error('動画をCloud Storageへアップロードできませんでした');
+      response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id:session.job_id,object_name:session.object_name})});
+    } else {
+      response = await fetch('/api/jobs', { method:'POST', headers:{'Content-Type':'video/mp4','X-Filename':encodeURIComponent(state.file.name),'X-File-Size':String(state.file.size)}, body:state.file });
+    }
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '動画を読み込めませんでした');
     state.jobId = data.job_id; localStorage.setItem('roughCutLastJobId', state.jobId); pollJob();
   } catch (error) { showStep(1); toast(error.message); }
@@ -106,23 +126,39 @@ function renderList(selector, values) { $(selector).innerHTML = (values || []).m
 function renderRoughCuts() {
   const candidates = state.result.candidates || [], understanding = state.result.video_understanding || {};
   showStep(5, 4); $('#central-theme').textContent = understanding.central_theme || '—'; renderList('#main-conclusions', understanding.main_conclusions); renderList('#important-points', understanding.important_points);
-  $('#rough-summary').textContent = `高い確信度で大きく削れそうな箇所を${candidates.length}件に絞りました。`;
-  $('#candidate-body').innerHTML = candidates.map((item,index) => `<tr><td><button class="time-button" type="button" data-candidate-index="${index}">${formatPrecise(item.start_seconds)}</button></td><td>${formatPrecise(item.end_seconds)}</td><td>${escapeHtml(item.resume_text || '—')}</td><td><strong>${escapeHtml(item.category)}</strong><br>${escapeHtml(item.reason)}</td></tr>`).join('');
+  const strongCount = candidates.filter(item => (item.decision || 'strong') === 'strong').length;
+  const reviewCount = candidates.filter(item => item.decision === 'review').length;
+  $('#rough-summary').textContent = `強いカット候補 ${strongCount}件、カット検討候補 ${reviewCount}件を見つけました。`;
+  $('#candidate-body').innerHTML = candidates.map((item,index) => { const decision = item.decision || 'strong'; const label = decision === 'review' ? 'カット検討' : '強い候補'; return `<tr><td><span class="decision-badge ${decision}">${label}</span></td><td><button class="time-button" type="button" data-candidate-index="${index}">${formatPrecise(item.start_seconds)}</button></td><td>${formatPrecise(item.end_seconds)}</td><td>${escapeHtml(item.resume_text || '—')}</td><td><strong>${escapeHtml(item.category)}</strong><br>${escapeHtml(item.reason)}</td></tr>`; }).join('');
   $('#empty-candidates').classList.toggle('hidden', candidates.length > 0); $('#copy-candidates-button').disabled = candidates.length === 0;
 }
 async function copyCandidates() {
-  const rows = [['開始','終了','カット終了後の話し始め'], ...(state.result?.candidates || []).map(item => [formatClock(item.start_seconds),formatClock(item.end_seconds),item.resume_text || ''])];
+  const rows = [['判定','開始','終了','カット終了後の話し始め'], ...(state.result?.candidates || []).map(item => [(item.decision || 'strong') === 'review' ? 'カット検討候補' : '強いカット候補',formatClock(item.start_seconds),formatClock(item.end_seconds),item.resume_text || ''])];
   const value = rows.map(row => row.join('\t')).join('\n'); try { await navigator.clipboard.writeText(value); } catch { const area=document.createElement('textarea');area.value=value;document.body.append(area);area.select();document.execCommand('copy');area.remove(); } toast('カット指示をコピーしました');
 }
 async function copyResults() {
   const rows = [['開始','終了','発言内容'], ...(state.result?.segments || []).map(item => [formatPrecise(item.start),formatPrecise(item.end),item.text || ''])];
   const text = rows.map(row => row.join('\t')).join('\n'); try { await navigator.clipboard.writeText(text); } catch { const area=document.createElement('textarea');area.value=text;document.body.append(area);area.select();document.execCommand('copy');area.remove(); } toast('タイムコード付き文字起こしをコピーしました');
 }
+function downloadSrt() {
+  const segments = (state.result?.segments || []).filter(item => String(item.text || '').trim());
+  if (!segments.length) return toast('保存できる文字起こしがありません');
+  const srt = segments.map((item, index) => `${index + 1}\n${formatSrtTime(item.start)} --> ${formatSrtTime(item.end)}\n${String(item.text).trim()}`).join('\n\n') + '\n';
+  const sourceName = state.result?.filename || state.file?.name || '文字起こし';
+  const baseName = sourceName.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_');
+  const blob = new Blob(['\uFEFF', srt], {type:'application/x-subrip;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url; link.download = `${baseName}_Vrew用.srt`;
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('Vrew用SRTを保存しました');
+}
 
 $('#drop-zone').addEventListener('click', () => $('#video-input').click()); $('#video-input').addEventListener('change', event => chooseFile(event.target.files[0]));
 ['dragenter','dragover'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.add('dragover'); }));
 ['dragleave','drop'].forEach(type => $('#drop-zone').addEventListener(type,event => { event.preventDefault(); $('#drop-zone').classList.remove('dragover'); })); $('#drop-zone').addEventListener('drop', event => chooseFile(event.dataTransfer.files[0]));
-$('#remove-file').addEventListener('click', clearFile); $('#start-button').addEventListener('click', startAnalysis); $('#copy-button').addEventListener('click', copyResults);
+$('#remove-file').addEventListener('click', clearFile); $('#start-button').addEventListener('click', startAnalysis); $('#copy-button').addEventListener('click', copyResults); $('#download-srt-button').addEventListener('click', downloadSrt); $('#rough-download-srt-button').addEventListener('click', downloadSrt);
 $('#rough-cut-button').addEventListener('click', startRoughCuts); $('#copy-candidates-button').addEventListener('click', copyCandidates); $('#back-transcript-button').addEventListener('click', () => { renderResults(); showStep(3,3); });
 $('#candidate-body').addEventListener('click', event => { const button=event.target.closest('[data-candidate-index]'); if(!button)return; const item=state.result?.candidates?.[Number(button.dataset.candidateIndex)]; const video=$('#result-video'); if(item&&video.src){video.currentTime=Math.max(0,Number(item.start_seconds)-1);video.play().catch(()=>{});} });
 $('#result-body').addEventListener('click', event => { const button = event.target.closest('[data-segment-index]'); if (!button) return; const segment = state.result?.segments?.[Number(button.dataset.segmentIndex)]; if (!segment) return; const video = $('#result-video'); video.currentTime = Math.max(0, Number(segment.start) - 1); video.play().catch(() => {}); });
@@ -130,7 +166,9 @@ $('#new-video-button').addEventListener('click', () => { clearFile(); state.resu
 $('#new-video-from-rough-button').addEventListener('click', () => { clearFile(); state.result=null; state.jobId=null; showStep(1); });
 $('#environment-button').addEventListener('click', () => checkEnvironment(true)); $('#close-dialog').addEventListener('click', () => $('#environment-dialog').close());
 async function restoreSavedJob() {
-  const requested = new URLSearchParams(location.search).get('job') || localStorage.getItem('roughCutLastJobId');
+  // 通常表示では前回の大きな文字起こし結果を取得しない。
+  // 結果を共有・再表示する明示的な ?job=... URLのときだけ読み込む。
+  const requested = new URLSearchParams(location.search).get('job');
   if (!requested || !/^[0-9a-f]+$/.test(requested)) return;
   try {
     const response = await fetch(`/api/jobs/${requested}`); if (!response.ok) return;

@@ -32,6 +32,13 @@ whisper.cppのモデルを `models/ggml-large-v3-turbo-q5_0.bin` に置くか、
 
 解析中の一時ファイルと結果は `data/jobs/` へ保存され、GitHubには送られません。
 
+## GitHubと実行時データ
+
+- ソースコードと更新頻度の低い設定JSONはGitHubのPrivateリポジトリへ保存します。
+- `config/*.json` はビルド時にコンテナへ同梱するため、通常閲覧時にGitHub APIを呼びません。
+- 動画・文字起こし・解析結果は容量と機密性の理由からGitHubへ保存せず、ローカルまたはCloud Storageへ保存します。
+- 通常の初期表示では前回結果を自動取得しません。`?job=...` を含む結果URLを開いた場合だけ保存済み結果を取得します。
+
 ## 将来拡張の入れ物
 
 `config/channel_rules.json` に、将来のチャンネル固有ルール・残す例・カット例を分離して追加できる構造を用意しています。MVPでは無効です。
