@@ -33,6 +33,9 @@ PORT = int(os.getenv("PORT", "8765"))
 # 高画質の収録素材は30分程度でも20GBを超えることがある。
 # ローカル処理なので、実用上の誤操作防止として100GBを上限にする。
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024
+# 課題提出用Cloud版だけは、予期しないStorage・Job利用を抑える。
+# local-first経路の100GB上限には影響させない。
+CLOUD_MAX_UPLOAD_BYTES = int(os.getenv("CLOUD_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 JOBS: dict[str, dict] = {}
 SELECTED_FILES: dict[str, Path] = {}
 LOCK = threading.Lock()
@@ -1191,7 +1194,9 @@ class Handler(BaseHTTPRequestHandler):
                 filename = str(payload.get("filename") or "video.mp4")
                 source_filename = str(payload.get("source_filename") or filename)
                 size = int(payload.get("size") or 0)
-                if size <= 0 or size > MAX_UPLOAD_BYTES: raise ValueError("動画のファイル容量が不正です。")
+                if size <= 0: raise ValueError("動画のファイル容量が不正です。")
+                if size > CLOUD_MAX_UPLOAD_BYTES:
+                    raise ValueError("公開版では1GB以下の動画に対応しています。")
                 media_kind = str(payload.get("media_kind") or "video")
                 if media_kind == "video" and not filename.lower().endswith(".mp4"): raise ValueError("MP4動画を選んでください。")
                 if media_kind == "audio" and not filename.lower().endswith((".m4a", ".mp4", ".wav")): raise ValueError("対応していない音声形式です。")

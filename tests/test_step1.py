@@ -8,6 +8,10 @@ import server
 
 
 class Step1SafetyTests(unittest.TestCase):
+    def test_cloud_limit_is_1gb_without_changing_local_limit(self):
+        self.assertEqual(server.CLOUD_MAX_UPLOAD_BYTES, 1024 * 1024 * 1024)
+        self.assertEqual(server.MAX_UPLOAD_BYTES, 100 * 1024 * 1024 * 1024)
+
     def test_whisper_tokens_are_preserved_without_words(self):
         payload = {
             "transcription": [{
